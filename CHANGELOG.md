@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+- Plate tools: `list_plates`, `get_plate`, `select_plate`, `add_plate`, `duplicate_plate`, `delete_plate` (refuses a plate that still holds objects unless `force`), `set_plate_settings` (name, lock, bed type, print sequence, first-layer filament order, spiral mode — validated together), `move_to_plate`, and `slice_all_plates`.
+- Project tools: `save_project` (with an optional Save As path), `open_project` and `new_project`, which refuse to drop unsaved work unless `discard` is set.
+- An optional `plate` index on `slice`, `slice_and_wait`, `get_gcode`, `save_gcode`, `render_plate`, `arrange_plate` and `auto_orient`, and `instance`/`plate` on `transform_object`.
+
+### Changed
+- Errors now keep the whole body the fork sent, not only its `error` token. A plate that cannot be sliced reports the slicer's own `message`, `reason` and `object`, and `slice_and_wait` no longer retries a refusal the slicer explained.
+
 ### Documentation
 - README: Windows fallback for `uvx` failing on `pywin32` with a sharing violation (pip venv, which retries). Findings in `docs/windows-install-findings-2026-09-22.md`, including the upstream 2.4.x "Profile syncing change" dialog and the fork's startup `remove_all` crash on a locked AppData datadir.
 

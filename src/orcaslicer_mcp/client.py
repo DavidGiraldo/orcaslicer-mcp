@@ -8,6 +8,11 @@ from .config import Config
 from .errors import error_from_status, NotReachable, ApiError, UiTimeout
 
 
+def _plate_params(plate: int | None) -> dict | None:
+    """Query parameters that address a plate by index; None leaves the fork on the current one."""
+    return {"plate": plate} if plate is not None else None
+
+
 class OrcaClient:
     def __init__(self, cfg: Config):
         self._cfg = cfg
@@ -72,8 +77,13 @@ class OrcaClient:
     async def set_object_config(self, obj_id: int, changes: dict) -> dict:
         return await self._request("PUT", f"/api/v1/objects/{obj_id}/config", json=changes)
 
-    async def transform_object(self, obj_id: int, translate=None, rotate=None, scale=None) -> dict:
+    async def transform_object(self, obj_id: int, translate=None, rotate=None, scale=None,
+                               instance: int | None = None, plate: int | None = None) -> dict:
         body = {}
+        if instance is not None:
+            body["instance"] = instance
+        if plate is not None:
+            body["plate"] = plate
         if translate is not None:
             body["translate"] = translate
         if rotate is not None:
@@ -82,11 +92,11 @@ class OrcaClient:
             body["scale"] = scale
         return await self._request("POST", f"/api/v1/objects/{obj_id}/transform", json=body)
 
-    async def arrange(self) -> dict:
-        return await self._request("POST", "/api/v1/arrange")
+    async def arrange(self, plate: int | None = None) -> dict:
+        return await self._request("POST", "/api/v1/arrange", params=_plate_params(plate))
 
-    async def orient(self) -> dict:
-        return await self._request("POST", "/api/v1/orient")
+    async def orient(self, plate: int | None = None) -> dict:
+        return await self._request("POST", "/api/v1/orient", params=_plate_params(plate))
 
     async def job_status(self) -> dict:
         return await self._request("GET", "/api/v1/jobs/status")
@@ -105,8 +115,8 @@ class OrcaClient:
     async def put_config(self, changes: dict) -> dict:
         return await self._request("PUT", "/api/v1/config", json=changes)
 
-    async def slice(self) -> dict:
-        return await self._request("POST", "/api/v1/slice")
+    async def slice(self, plate: int | None = None) -> dict:
+        return await self._request("POST", "/api/v1/slice", params=_plate_params(plate))
 
     async def slice_status(self) -> dict:
         return await self._request("GET", "/api/v1/slice/status")
@@ -148,9 +158,9 @@ class OrcaClient:
         body = {"clear": True} if clear else {"min_z": min_z, "max_z": max_z, "layer_height": layer_height}
         return await self._request("PUT", f"/api/v1/objects/{obj_id}/height_range", json=body)
 
-    async def get_gcode(self) -> bytes:
+    async def get_gcode(self, plate: int | None = None) -> bytes:
         try:
-            resp = await self._http.get("/api/v1/gcode")
+            resp = await self._http.get("/api/v1/gcode", params=_plate_params(plate))
         except httpx.TimeoutException as e:
             raise UiTimeout(f"OrcaSlicer did not respond in time: {e}") from e
         except httpx.TransportError as e:
@@ -165,11 +175,13 @@ class OrcaClient:
 
     async def get_plate_render(self, view: str = "editor", angle: str = "iso",
                                width: int = 800, height: int = 600,
-                               frame: str | None = None) -> bytes:
+                               frame: str | None = None, plate: int | None = None) -> bytes:
         params: dict[str, str | int] = {
             "view": view, "angle": angle, "width": width, "height": height}
         if frame is not None:
             params["frame"] = frame
+        if plate is not None:
+            params["plate"] = plate
         try:
             resp = await self._http.get("/api/v1/plate/render", params=params)
         except httpx.TimeoutException as e:
@@ -183,6 +195,46 @@ class OrcaClient:
                 body = {}
             raise error_from_status(resp.status_code, body)
         return resp.content
+
+    # --- plates ---------------------------------------------------------------
+
+    async def list_plates(self) -> dict:
+        return await self._request("GET", "/api/v1/plates")
+
+    async def get_plate(self, index: int) -> dict:
+        return await self._request("GET", f"/api/v1/plates/{index}")
+
+    async def add_plate(self, name: str | None = None) -> dict:
+        return await self._request("POST", "/api/v1/plates",
+                                   json={"name": name} if name is not None else {})
+
+    async def duplicate_plate(self, index: int) -> dict:
+        return await self._request("POST", f"/api/v1/plates/{index}/duplicate")
+
+    async def select_plate(self, index: int) -> dict:
+        return await self._request("POST", f"/api/v1/plates/{index}/select")
+
+    async def update_plate(self, index: int, changes: dict) -> dict:
+        return await self._request("PUT", f"/api/v1/plates/{index}", json=changes)
+
+    async def delete_plate(self, index: int, force: bool = False) -> dict:
+        return await self._request("DELETE", f"/api/v1/plates/{index}",
+                                   params={"force": "true"} if force else None)
+
+    # --- project --------------------------------------------------------------
+    # The fork holds save/open for up to 120 s and new for 60 s; give the read a margin.
+
+    async def save_project(self, path: str | None = None) -> dict:
+        return await self._request("POST", "/api/v1/project/save",
+                                   json={"path": path} if path else {}, timeout=130.0)
+
+    async def open_project(self, path: str, discard: bool = False) -> dict:
+        return await self._request("POST", "/api/v1/project/open",
+                                   json={"path": path, "discard": discard}, timeout=130.0)
+
+    async def new_project(self, discard: bool = False) -> dict:
+        return await self._request("POST", "/api/v1/project/new",
+                                   json={"discard": discard}, timeout=70.0)
 
     def _ws_url(self) -> str:
         base = self._cfg.base_url

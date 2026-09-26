@@ -59,21 +59,27 @@ async def _wait_for_slice(c, timeout: int) -> dict:
     return s
 
 
-async def _start_slice(c) -> dict:
+async def _start_slice(c, plate: int | None = None) -> dict:
     """POST /slice with one retry: right after a slice completes, the fork's
     background process can transiently decline to restart (422 slice_not_started,
-    surfaced by the F2 wedge detection). One short pause clears it."""
+    surfaced by the F2 wedge detection). One short pause clears it. A refusal the
+    slicer explains (reason=validation/outside) is real, so it is not retried."""
     try:
-        return await c.slice()
+        return await c.slice(plate)
     except Validation as e:
-        if "slice_not_started" not in str(e):
+        if "slice_not_started" not in str(e) or e.body.get("reason") in ("validation", "outside"):
             raise
         await asyncio.sleep(1.5)
-        return await c.slice()
+        return await c.slice(plate)
 
 
 def _err(e: ApiError) -> dict:
     out = {"error": str(e)}
+    # Keep whatever else the fork said: slice_not_started carries the slicer's own message and
+    # reason, project_dirty says what is unsaved, plate_not_empty lists the objects.
+    for k, v in (e.body or {}).items():
+        if k != "error":
+            out.setdefault(k, v)
     if isinstance(e, Validation):
         out["errors"] = e.errors
     return out
@@ -128,16 +134,22 @@ async def set_config(
 
 
 @mcp.tool()
-async def slice() -> dict:
-    """Start slicing the current plate in the background and return immediately, without waiting
-    for the result. The reply is 'started' (a slice began), 'already_valid' (the plate is
-    unchanged and the last result still holds), or a conflict if a slice is already running.
+async def slice(
+    plate: Annotated[int | None, Field(description=(
+        "Plate index (0-based, as in list_plates) to act on instead of the current plate. "
+        "Slicing, rendering, arranging or orienting a plate also makes it the current one."))] = None,
+) -> dict:
+    """Start slicing the current plate (or `plate`) in the background and return immediately,
+    without waiting for the result. The reply is 'started' (a slice began), 'already_valid' (the
+    plate is unchanged and the last result still holds), or a conflict if a slice is already
+    running. When the plate cannot be sliced the error carries the slicer's own `message` and a
+    `reason` (outside / validation), e.g. "... is too close to others".
 
     Fire-and-forget: poll get_slice_status for progress and stats, or cancel_slice to stop it.
     Prefer slice_and_wait when you want the finished stats back in one call."""
     try:
         async with _client() as c:
-            return await c.slice()
+            return await c.slice(plate)
     except ApiError as e:
         return _err(e)
 
@@ -214,22 +226,55 @@ async def slice_and_wait(
     timeout: Annotated[int, Field(description=(
         "Maximum seconds to wait for the slice to finish before returning the last known "
         "state. Default 300; raise it for large or textured plates that slice slowly."))] = 300,
+    plate: Annotated[int | None, Field(description=(
+        "Plate index (0-based, as in list_plates) to act on instead of the current plate. "
+        "Slicing, rendering, arranging or orienting a plate also makes it the current one."))] = None,
 ) -> dict:
-    """Slice the current plate and block until it finishes, then return the final stats and
-    warnings in one call. If the plate is already sliced and unchanged, it returns the existing
-    result without re-slicing.
+    """Slice the current plate (or `plate`) and block until it finishes, then return the final
+    stats and warnings in one call. If the plate is already sliced and unchanged, it returns the
+    existing result without re-slicing. To slice every plate in turn, use slice_all_plates.
 
     This is the usual way to slice when you want the outcome immediately. For a non-blocking
     start, use slice then poll get_slice_status; to sweep one setting across values, use
     compare_settings."""
     try:
         async with _client() as c:
-            started = await _start_slice(c)
+            started = await _start_slice(c, plate)
             if started.get("already_valid"):
                 return summarize_slice(await c.slice_status())
             return summarize_slice(await _wait_for_slice(c, timeout))
     except ApiError as e:
         return _err(e)
+
+
+@mcp.tool()
+async def slice_all_plates(
+    timeout_per_plate: Annotated[int, Field(description=(
+        "Maximum seconds to wait for each plate's slice. Default 300."))] = 300,
+) -> dict:
+    """Slice every non-empty plate in turn, as the slicer's "Slice all" does, waiting for each
+    before starting the next. Returns one entry per plate with its stats, or the error and the
+    slicer's own message when that plate cannot be sliced; one plate failing does not stop the
+    others. Leaves the last sliced plate as the current one."""
+    results = []
+    try:
+        async with _client() as c:
+            plates = (await c.list_plates()).get("plates") or []
+            for pl in plates:
+                idx = pl.get("index")
+                if pl.get("empty"):
+                    results.append({"plate": idx, "skipped": "empty"})
+                    continue
+                try:
+                    started = await _start_slice(c, idx)
+                    status = (await c.slice_status() if started.get("already_valid")
+                              else await _wait_for_slice(c, timeout_per_plate))
+                    results.append({"plate": idx, **summarize_slice(status)})
+                except ApiError as e:
+                    results.append({"plate": idx, **_err(e)})
+    except ApiError as e:
+        return _err(e)
+    return {"plates": results}
 
 
 @mcp.tool()
@@ -410,7 +455,9 @@ def _m4c_err(e: ApiError) -> dict:
 
 @mcp.tool()
 async def list_objects() -> dict:
-    """List objects on the current plate: id (stable), name, size_mm, and transform (offset/rotation/scale)."""
+    """List objects in the project: id (stable), name, size_mm, transform (offset/rotation/scale)
+    of instance 0, `plate` (the plate index instance 0 sits on, -1 for none) and
+    `instance_plates` (the plate of every instance)."""
     try:
         async with _client() as c:
             return await c.get_objects()
@@ -459,31 +506,58 @@ async def delete_object(
 @mcp.tool()
 async def transform_object(object_id: int, translate: list[float] | None = None,
                            rotate: list[float] | None = None,
-                           scale: list[float] | None = None) -> dict:
-    """Move/rotate/scale an object by id. translate=[dx,dy,dz] mm (relative), rotate=[rx,ry,rz] degrees (relative), scale=[sx,sy,sz] absolute factor. Provide at least one."""
+                           scale: list[float] | None = None,
+                           instance: int | None = None,
+                           plate: int | None = None) -> dict:
+    """Move/rotate/scale an object by id. translate=[dx,dy,dz] mm (relative), rotate=[rx,ry,rz] degrees (relative), scale=[sx,sy,sz] absolute factor. instance picks which copy (default 0); plate moves it onto that plate (0-based), keeping its position relative to the plate, before translate is applied. Provide at least one of plate/translate/rotate/scale."""
     try:
         async with _client() as c:
-            return await c.transform_object(object_id, translate, rotate, scale)
+            return await c.transform_object(object_id, translate, rotate, scale,
+                                            instance=instance, plate=plate)
     except ApiError as e:
         return _m4b_err(e)
 
 
 @mcp.tool()
-async def arrange_plate() -> dict:
-    """Auto-arrange all objects on the plate (async job; poll get_job_status until idle)."""
+async def move_to_plate(
+    object_id: Annotated[int, Field(description="Object id from list_objects.")],
+    plate: Annotated[int, Field(description="Target plate index (0-based, as in list_plates).")],
+    instance: Annotated[int, Field(description="Which copy of the object to move (default 0).")] = 0,
+) -> dict:
+    """Move one copy of an object to another plate, keeping where it sits relative to the plate
+    (a copy that sits on no plate is centred on the target). Returns the plate it now sits on.
+    Re-slice the affected plates afterwards."""
     try:
         async with _client() as c:
-            return await c.arrange()
+            return await c.transform_object(object_id, instance=instance, plate=plate)
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def arrange_plate(
+    plate: Annotated[int | None, Field(description=(
+        "Arrange only this plate (0-based) and make it current, as the plate's own menu does. "
+        "Omit to arrange every plate, as the toolbar button does."))] = None,
+) -> dict:
+    """Auto-arrange objects (async job; poll get_job_status until idle). Locked plates are
+    skipped; arranging a locked plate by index is refused with plate_locked."""
+    try:
+        async with _client() as c:
+            return await c.arrange(plate)
     except ApiError as e:
         return _m4b_err(e)
 
 
 @mcp.tool()
-async def auto_orient() -> dict:
-    """Auto-orient all objects for printing (async job; poll get_job_status until idle)."""
+async def auto_orient(
+    plate: Annotated[int | None, Field(description=(
+        "Orient only the objects on this plate (0-based). Omit for all objects."))] = None,
+) -> dict:
+    """Auto-orient objects for printing (async job; poll get_job_status until idle)."""
     try:
         async with _client() as c:
-            return await c.orient()
+            return await c.orient(plate)
     except ApiError as e:
         return _m4b_err(e)
 
@@ -954,11 +1028,15 @@ async def rename_preset(
 
 
 @mcp.tool()
-async def get_gcode() -> dict:
-    """Retrieve the last successful slice's G-code as text."""
+async def get_gcode(
+    plate: Annotated[int | None, Field(description=(
+        "Read this plate's slice (0-based) without changing the current plate. "
+        "Omit for the current plate."))] = None,
+) -> dict:
+    """Retrieve the current plate's (or `plate`'s) sliced G-code as text."""
     try:
         async with _client() as c:
-            data = await c.get_gcode()
+            data = await c.get_gcode(plate)
             return {"bytes": len(data), "gcode": data.decode("utf-8", errors="replace")}
     except Conflict:
         return {"error": "not_sliced"}
@@ -1052,7 +1130,7 @@ def _gcode_base_dir() -> Path:
 
 
 @mcp.tool()
-async def save_gcode(filename: str | None = None) -> dict:
+async def save_gcode(filename: str | None = None, plate: int | None = None) -> dict:
     """Save the last successful slice's G-code and record the slice (model, geometry, full
     settings snapshot) under that filename, so that when klipper-mcp later prints this exact
     file the real outcome joins back to these settings. Returns the saved path; hand it to
@@ -1061,11 +1139,15 @@ async def save_gcode(filename: str | None = None) -> dict:
     under PRINT_OUTCOMES_DIR if set, else under the shared print-outcomes folder
     (~/projects/_shared/print-outcomes) if it already exists, else under ~/.orcaslicer-mcp;
     the gcode folder itself is created if missing. If the shared outcome store is not present,
-    or the store write fails, the file is still saved and outcome_recorded is False."""
+    or the store write fails, the file is still saved and outcome_recorded is False.
+    `plate` (0-based) saves that plate's slice instead of the current plate's, without
+    switching plates."""
     try:
         async with _client() as c:
-            data = await c.get_gcode()
+            data = await c.get_gcode(plate)
             objs = (await c.get_objects()).get("objects") or []
+            if plate is not None:
+                objs = [o for o in objs if o.get("plate") == plate] or objs
             cfg = await c.get_config(None)
     except Conflict:
         return {"error": "not_sliced"}
@@ -1150,8 +1232,9 @@ async def recall_prints(model_name: str | None = None, limit: int = 5) -> dict:
 @mcp.tool()
 async def render_plate(view: str = "editor", angle: str = "iso",
                        width: int = 800, height: int = 600,
-                       frame: str | None = None):
-    """Render a PNG picture of the current plate so you can SEE it.
+                       frame: str | None = None, plate: int | None = None):
+    """Render a PNG picture of the current plate (or `plate`, 0-based, which also makes it the
+    current one) so you can SEE it.
 
     view="editor": the models on the bed BEFORE slicing - use to check
     orientation, plate contact, and first-layer footprint (an Euler triple is
@@ -1167,7 +1250,7 @@ async def render_plate(view: str = "editor", angle: str = "iso",
     try:
         async with _client() as c:
             png = await c.get_plate_render(view=view, angle=angle,
-                                           width=width, height=height, frame=frame)
+                                           width=width, height=height, frame=frame, plate=plate)
             return Image(data=png, format="png")
     except Conflict:
         return {"error": "no_slice_result",
@@ -1175,6 +1258,161 @@ async def render_plate(view: str = "editor", angle: str = "iso",
     except ApiError as e:
         return _m4_err(e, "plate_render (fork v2.3.2-mcp.4+)")
 
+
+
+# --- Plates -------------------------------------------------------------------
+
+@mcp.tool()
+async def list_plates() -> dict:
+    """List every plate: index (0-based), name, whether it is current, locked, empty or sliced,
+    its per-plate settings (bed_type, print_sequence, first_layer_sequence, spiral_mode, each
+    with the effective value that applies) and the objects/instances on it. Read-only.
+
+    Plate indices are what every `plate` argument takes."""
+    try:
+        async with _client() as c:
+            return await c.list_plates()
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def get_plate(index: Annotated[int, Field(description="Plate index (0-based).")]) -> dict:
+    """One plate's details, as in list_plates. Read-only."""
+    try:
+        async with _client() as c:
+            return await c.get_plate(index)
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def select_plate(index: Annotated[int, Field(description="Plate index (0-based).")]) -> dict:
+    """Make a plate the current one, as clicking its tab does. Tools without a `plate`
+    argument then act on it. Refused while a slice runs."""
+    try:
+        async with _client() as c:
+            return await c.select_plate(index)
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def add_plate(name: Annotated[str | None, Field(description="Optional plate name.")] = None) -> dict:
+    """Add an empty plate after the last one and make it current. Returns the new plate."""
+    try:
+        async with _client() as c:
+            return await c.add_plate(name)
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def duplicate_plate(index: Annotated[int, Field(description="Plate index (0-based) to copy.")]) -> dict:
+    """Add a copy of a plate, with copies of all its objects, after the last plate. Returns the
+    new plate."""
+    try:
+        async with _client() as c:
+            return await c.duplicate_plate(index)
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def set_plate_settings(
+    index: Annotated[int, Field(description="Plate index (0-based).")],
+    name: Annotated[str | None, Field(description="Rename the plate.")] = None,
+    locked: Annotated[bool | None, Field(description=(
+        "Lock or unlock the plate. A locked plate is skipped by arrange and orient."))] = None,
+    bed_type: Annotated[str | None, Field(description=(
+        "'default' to follow the global bed type, or one of 'Cool Plate', 'Engineering Plate', "
+        "'High Temp Plate', 'Textured PEI Plate', 'Textured Cool Plate', 'Supertack Plate'."))] = None,
+    print_sequence: Annotated[str | None, Field(description=(
+        "'by layer', 'by object', or 'default' to follow the process preset."))] = None,
+    first_layer_sequence: Annotated[list[int] | None, Field(description=(
+        "Order of filaments on the first layer, 1-based filament numbers; [] for automatic."))] = None,
+    spiral_mode: Annotated[bool | str | None, Field(description=(
+        "true/false for spiral vase on this plate, or 'default' to follow the global setting."))] = None,
+) -> dict:
+    """Rename, lock, or change a plate's own settings, as the Plate Settings dialog does. Only
+    the arguments given change, and they are validated together: one bad value changes nothing
+    (the error lists each problem). Changing bed type or print sequence invalidates the plate's
+    slice."""
+    changes = {k: v for k, v in {
+        "name": name, "locked": locked, "bed_type": bed_type, "print_sequence": print_sequence,
+        "first_layer_sequence": first_layer_sequence, "spiral_mode": spiral_mode}.items()
+        if v is not None}
+    if not changes:
+        return {"error": "nothing_to_change"}
+    try:
+        async with _client() as c:
+            return await c.update_plate(index, changes)
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def delete_plate(
+    index: Annotated[int, Field(description="Plate index (0-based).")],
+    force: Annotated[bool, Field(description=(
+        "Required when the plate still holds objects. The slicer does not delete them: it moves "
+        "them onto the last plate or off every plate."))] = False,
+) -> dict:
+    """Delete a plate. Refused for the only plate, while slicing, or - without force - when the
+    plate still holds objects (the error lists them). Later plates shift down by one index."""
+    try:
+        async with _client() as c:
+            return await c.delete_plate(index, force)
+    except ApiError as e:
+        return _err(e)
+
+
+# --- Project ------------------------------------------------------------------
+
+@mcp.tool()
+async def save_project(
+    path: Annotated[str | None, Field(description=(
+        "Where to save, ending in .3mf, whose folder must exist (Save As). Omit to save where "
+        "the project was opened or last saved."))] = None,
+) -> dict:
+    """Save the project (all plates, objects and per-plate settings) as a .3mf. Overwrites the
+    file at that path. Refused when the project was never saved and no path is given."""
+    try:
+        async with _client() as c:
+            return await c.save_project(path)
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def open_project(
+    path: Annotated[str, Field(description="Path to a .3mf project on the slicer's machine.")],
+    discard: Annotated[bool, Field(description=(
+        "Drop unsaved changes in the current project and presets. Without it, unsaved work "
+        "makes the call fail with project_dirty instead of losing it."))] = False,
+) -> dict:
+    """Open a .3mf project, replacing the current one. Refused with project_dirty when there is
+    unsaved work, unless discard is set; save_project first to keep it."""
+    try:
+        async with _client() as c:
+            return await c.open_project(path, discard)
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def new_project(
+    discard: Annotated[bool, Field(description=(
+        "Drop unsaved changes. Without it, unsaved work makes the call fail with "
+        "project_dirty."))] = False,
+) -> dict:
+    """Start a new, empty project, replacing the current one. Refused with project_dirty when
+    there is unsaved work, unless discard is set."""
+    try:
+        async with _client() as c:
+            return await c.new_project(discard)
+    except ApiError as e:
+        return _err(e)
 
 
 # --- Tool annotations (title + read-only/destructive hints) -----------------
@@ -1229,6 +1467,18 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     "edit_preset": ("Edit preset (overwrites stored settings)", False, True),
     "delete_object": ("Delete object from plate", False, True),
     "delete_preset": ("Delete preset", False, True),
+    "list_plates": ("List plates", True, False),
+    "get_plate": ("Get plate details", True, False),
+    "select_plate": ("Select plate", False, False),
+    "add_plate": ("Add plate", False, False),
+    "duplicate_plate": ("Duplicate plate", False, False),
+    "set_plate_settings": ("Set plate settings", False, False),
+    "move_to_plate": ("Move object to plate", False, False),
+    "slice_all_plates": ("Slice all plates", False, False),
+    "delete_plate": ("Delete plate", False, True),
+    "save_project": ("Save project (overwrites the .3mf)", False, True),
+    "open_project": ("Open project (replaces the current one)", False, True),
+    "new_project": ("New project (replaces the current one)", False, True),
 }
 
 

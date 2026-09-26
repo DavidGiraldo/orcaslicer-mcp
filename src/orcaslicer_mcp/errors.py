@@ -2,7 +2,10 @@ from __future__ import annotations
 
 
 class ApiError(Exception):
-    pass
+    # The fork's JSON error body. Beyond the `error` token it can carry the details a caller
+    # needs (slice_not_started's message/reason/object, project_dirty's model_dirty, a
+    # plate_not_empty's objects), so it travels with the exception.
+    body: dict = {}
 
 
 class Unauthorized(ApiError):
@@ -50,6 +53,12 @@ class Validation(ApiError):
 
 
 def error_from_status(status: int, body: dict) -> ApiError:
+    err = _error_for(status, body)
+    err.body = body if isinstance(body, dict) else {}
+    return err
+
+
+def _error_for(status: int, body: dict) -> ApiError:
     msg = body.get("error") or body.get("detail") or f"HTTP {status}"
     if status == 401:
         return Unauthorized("unauthorized (check ORCA_API_TOKEN)")

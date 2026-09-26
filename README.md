@@ -66,7 +66,11 @@ It only crowns a winner when one variant genuinely beats the rest on time, filam
 
 ### Models and the plate
 
-`load_model` (`.stl`, `.obj`, `.3mf`, plus `.step` and `.stp` on fork v2.3.2-mcp.3 and later), `list_objects` with each object's world-space bounding box and an `on_plate` flag, `transform_object`, `duplicate_object`, `delete_object`, `arrange_plate`, `auto_orient`, `check_placement`, `diagnose_plate`, `get_job_status`.
+`load_model` (`.stl`, `.obj`, `.3mf`, plus `.step` and `.stp` on fork v2.3.2-mcp.3 and later), `list_objects` with each object's world-space bounding box, an `on_plate` flag and the plate each copy sits on, `transform_object` (any copy, via `instance`), `duplicate_object`, `delete_object`, `arrange_plate`, `auto_orient`, `check_placement`, `diagnose_plate`, `get_job_status`.
+
+### Plates and projects
+
+A project can hold several plates, each with its own bed type, print sequence, first-layer filament order and spiral mode. `list_plates` and `get_plate` show them, with the objects on each; `select_plate`, `add_plate`, `duplicate_plate` and `delete_plate` manage them; `set_plate_settings` renames, locks and configures one the way the Plate Settings dialog does; `move_to_plate` moves a copy of an object across. The tools that act on "the current plate" — `slice`, `slice_and_wait`, `get_gcode`, `save_gcode`, `render_plate`, `arrange_plate`, `auto_orient` — take an optional `plate` index, and `slice_all_plates` slices every non-empty plate in turn. When a plate cannot be sliced the error carries the slicer's own reason, such as "Lid Clip.stl is too close to others". `save_project`, `open_project` and `new_project` handle the `.3mf`, refusing to drop unsaved work unless told to. All of this needs a fork build with the plate and project routes.
 
 ### Plate renders
 
